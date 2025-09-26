@@ -12,15 +12,17 @@ The Lightning Network is a second-layer payment protocol built on top of Bitcoin
 
 This project simulates two distinct routing approaches:
 
-1. **No Information Sharing**: Only sender and receiver nodes have knowledge of their own channel capacities
-2. **With Information Sharing**: Intermediate nodes can optionally share their channel information based on willingness probability
+1. **No Information Sharing**: Only sender knows their own channel capacities (receiver knowledge not available)
+2. **With Information Sharing**: Receiver and intermediate nodes can optionally share their channel information based on willingness probability
 
 ## 🎯 Key Features
 
 ### 🔬 **Dual-Mode Simulation**
 - **Sender-View Routing**: Models realistic Lightning Network routing where senders have limited knowledge
-- **Information Sharing**: Configurable willingness-based sharing between intermediate nodes
-- **Edge Pruning**: Intelligent path pruning to avoid re-trying failed routes
+- **Information Sharing**: Configurable willingness-based sharing between receiver and intermediate nodes
+- **Smart Edge Pruning**: 
+  - **No Info Sharing**: Prunes only the first failing edge
+  - **With Info Sharing**: Prunes ALL insufficient edges we have information about
 - **Ground Truth Validation**: Tests against actual channel balances for realistic results
 
 ### 📊 **Comprehensive Analysis**
@@ -242,11 +244,17 @@ COMPARISON RESULTS
 - **Faster Routing**: Often reduces execution time by 20-30%
 - **Better Path Discovery**: More accurate capacity information leads to better path selection
 - **Reduced Exploration**: Fewer paths need to be checked before success
+- **Aggressive Pruning**: With info sharing, ALL insufficient edges are removed, not just the first failing one
 
 ### Information Sharing Costs
 - **Computational Overhead**: Sharing and processing additional information takes time
 - **Privacy Concerns**: More information sharing reduces privacy
 - **Network Load**: Additional communication overhead
+
+### Pruning Strategies
+- **No Info Sharing**: Conservative approach - removes only the first failing edge (sender knows only their own edges)
+- **With Info Sharing**: Aggressive approach - removes ALL edges with insufficient capacity that we have information about (includes receiver and intermediate node knowledge)
+- **Why Aggressive Helps**: More information allows for better pruning decisions, potentially avoiding multiple failed attempts
 
 ### Factors Affecting Efficiency
 - **Payment Amount**: Larger payments may benefit more from information sharing

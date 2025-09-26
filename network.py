@@ -127,10 +127,12 @@ class SenderViewSim(LightningNetworkBase):
     Edge-smart sender simulation with configurable information sharing:
       - Routing over a mutable copy G_route (we prune edges on failures)
       - Ground-truth directed balances G_dir (immutable)
-      - Sender knowledge updated by information sharing only (no capacity changes)
+      - Sender initially knows only their own edges (not receiver's)
+      - Receiver and intermediate nodes can share information based on willingness
       - Supports both no-info-sharing and with-info-sharing modes
       - Pre-filter s,t to ensure shortest path is long enough
-      - On any failure (view or true): prune the *first failing hop* and restart path enumeration
+      - No-info-sharing mode: prune the *first failing hop* and restart path enumeration
+      - With-info-sharing mode: prune ALL insufficient edges we know about after sharing
     """
 
     def __init__(self, json_file: str = "LNdata.json", seed: Optional[int] = 42, 
@@ -206,6 +208,64 @@ class SenderViewSim(LightningNetworkBase):
             if not G_route.has_edge(u, v) or G_route[u][v]["capacity"] < amount:
                 return (u, v, "undirected")
         return None
+
+    def _find_all_insufficient_edges_after_sharing(
+        self,
+        path: List[str],
+        amount: float,
+        G_route: nx.Graph,
+    ) -> List[Tuple[str, str, str]]:
+        """
+        Find ALL edges along 'path' that have insufficient capacity after information sharing.
+        Returns list of (u, v, reason) tuples where reason ∈ {'directed_src', 'directed_dst', 'undirected'}.
+        Only includes edges we have information about (not unknown edges).
+        """
+        insufficient_edges = []
+        
+        for u, v in zip(path[:-1], path[1:]):
+            # Check if we have directed knowledge from u's OUT
+            if (u in self.sender_view) and (v in self.sender_view[u]["out"]):
+                if self.sender_view[u]["out"][v] < amount:
+                    insufficient_edges.append((u, v, "directed_src"))
+                continue  # Skip other checks for this edge
+            
+            # Check if we have directed knowledge from v's IN
+            if (v in self.sender_view) and (u in self.sender_view[v]["in"]):
+                if self.sender_view[v]["in"][u] < amount:
+                    insufficient_edges.append((u, v, "directed_dst"))
+                continue  # Skip other checks for this edge
+            
+            # For edges we don't have directed knowledge about, check undirected capacity
+            # Only include if we know the undirected capacity is insufficient
+            if G_route.has_edge(u, v):
+                if G_route[u][v]["capacity"] < amount:
+                    insufficient_edges.append((u, v, "undirected"))
+            # Note: We don't include edges that don't exist in G_route as "insufficient"
+            # because we don't have capacity information about them
+        
+        return insufficient_edges
+
+    def _pre_prune_source_edges(self, G_route: nx.Graph, source: str, amount: float) -> None:
+        """
+        Pre-prune source outgoing edges with insufficient capacity before path finding.
+        This replaces Phase 1 testing by removing known bad edges upfront.
+        """
+        if source not in self.sender_view:
+            return
+        
+        edges_to_remove = []
+        for neighbor in self.sender_view[source]["out"]:
+            if self.sender_view[source]["out"][neighbor] < amount:
+                edges_to_remove.append((source, neighbor))
+        
+        for u, v in edges_to_remove:
+            if G_route.has_edge(u, v):
+                G_route.remove_edge(u, v)
+                if self.verbose:
+                    print(f"Pre-pruned insufficient source edge: {u} -- {v} (capacity: {self.sender_view[source]['out'][v]})")
+        
+        if self.verbose and edges_to_remove:
+            print(f"Pre-pruned {len(edges_to_remove)} insufficient source edges")
 
     # -------------------- Paths --------------------
 
@@ -381,14 +441,16 @@ class SenderViewSim(LightningNetworkBase):
             print(f"Receiver: {t}")
             print(f"Mode: {self.mode.value}")
 
-        # Initialize knowledge for BOTH endpoints
+        # Initialize knowledge for SENDER ONLY initially
         self.sender_view.clear()
         self._init_sender_view_for(s)
-        self._init_sender_view_for(t)
         
         if self.verbose:
-            print("\nInitialized sender's local view for: sender AND receiver.")
+            print("\nInitialized sender's local view for: sender ONLY (receiver knowledge will come from sharing).")
 
+        # Pre-prune source outgoing edges with insufficient capacity
+        self._pre_prune_source_edges(G_route, s, amount)
+        
         paths_used = 0  # total paths tested across restarts
 
         while paths_used < max_paths_checked:
@@ -441,43 +503,14 @@ class SenderViewSim(LightningNetworkBase):
                         failure_reason="Path budget exceeded"
                     )
 
-                # -------- Phase A: S/T-only feasibility --------
-                if self.verbose:
-                    self._print_path_structured(
-                        path_idx=paths_used,
-                        path=path,
-                        amount=amount,
-                        G_view_for_undirected=G_route,
-                        phase="A: ST-only",
-                        show_nodes_line=True,
-                        header="Candidate Path",
-                    )
-
-                failing = self._first_failing_hop_by_view(path, amount, G_route)
-                feasible_st_only = (failing is None)
-                if self.verbose:
-                    print(f"Feasible by S/T-only view? {'YES' if feasible_st_only else 'NO'}")
-
-                if not feasible_st_only:
-                    # PRUNE first failing hop and restart the generator
-                    u, v, reason = failing
-                    if G_route.has_edge(u, v):
-                        G_route.remove_edge(u, v)
-                        if self.verbose:
-                            print(f"Pruned edge due to {reason}: {u} -- {v}")
-                    else:
-                        if self.verbose:
-                            print(f"No prune (edge missing): {u} -- {v} (reason={reason})")
-                    pruned_this_round = True
-                    break  # restart generator on new G_route
-
-                # -------- Phase B: info sharing by willingness (only if mode allows) --------
+                # -------- Phase A: info sharing by willingness (only if mode allows) --------
                 if self.mode == SimulationMode.WITH_INFO_SHARING:
                     willingness = {node: (self._rng.random() < p_willing) for node in path}
-                    nodes_to_share = path[:] if include_endpoints_in_share else path[1:-1]
+                    # Always include receiver in sharing since sender doesn't know receiver initially
+                    nodes_to_share = path[1:]  # All nodes except sender (receiver + intermediates)
                     if self.verbose:
-                        print("\nWillingness among non-endpoints:")
-                        for node in (path[1:-1] if not include_endpoints_in_share else path):
+                        print("\nWillingness among nodes (excluding sender):")
+                        for node in nodes_to_share:
                             flag = "willing" if willingness.get(node, False) else "not willing"
                             print(f"  {node}: {flag}")
 
@@ -492,31 +525,40 @@ class SenderViewSim(LightningNetworkBase):
                             path=path,
                             amount=amount,
                             G_view_for_undirected=G_route,
-                            phase="B: after shares",
-                            show_nodes_line=False,
+                            phase="A: after shares",
+                            show_nodes_line=True,
                             header="Candidate Path",
                         )
-                    failing_b = self._first_failing_hop_by_view(path, amount, G_route)
-                    feasible_after_shares = (failing_b is None)
+                    
+                    # Find and prune ALL insufficient edges we now know about
+                    insufficient_edges = self._find_all_insufficient_edges_after_sharing(path, amount, G_route)
+                    feasible_after_shares = (len(insufficient_edges) == 0)
                     if self.verbose:
                         print(f"Feasible after shares? {'YES' if feasible_after_shares else 'NO'}")
+                        if insufficient_edges:
+                            print(f"Found {len(insufficient_edges)} insufficient edges after sharing")
 
                     if not feasible_after_shares:
-                        # PRUNE first failing hop and restart
-                        u, v, reason = failing_b
-                        if G_route.has_edge(u, v):
-                            G_route.remove_edge(u, v)
-                            if self.verbose:
-                                print(f"Pruned edge due to {reason}: {u} -- {v}")
-                        else:
-                            if self.verbose:
-                                print(f"No prune (edge missing): {u} -- {v} (reason={reason})")
+                        # PRUNE ALL insufficient edges we now know about
+                        edges_pruned = 0
+                        for u, v, reason in insufficient_edges:
+                            if G_route.has_edge(u, v):
+                                G_route.remove_edge(u, v)
+                                edges_pruned += 1
+                                if self.verbose:
+                                    print(f"Pruned edge due to {reason}: {u} -- {v}")
+                            else:
+                                if self.verbose:
+                                    print(f"No prune (edge missing): {u} -- {v} (reason={reason})")
+                        
+                        if self.verbose:
+                            print(f"Total edges pruned after sharing: {edges_pruned}")
                         pruned_this_round = True
                         break  # restart generator
                 else:
-                    # No info sharing mode - skip Phase B
+                    # No info sharing mode - no additional processing needed
                     if self.verbose:
-                        print("Skipping info sharing (no-info-sharing mode)")
+                        print("No info sharing mode - using pre-pruned graph")
 
                 # -------- Try the TRUE send on G_dir --------
                 true_ok = self._true_path_feasible(self.G_dir, path, amount)
@@ -797,7 +839,14 @@ def main():
     sender_receiver_pairs = [
         # Add your specific pairs here, or use random generation
         # ("node_id_1", "node_id_2"),
-        ("03a99bf1dca445c12865309438cde223144346340cd45a6a789130123b6dda583c", "02c1d72c2fecc8df99351d3959d1f419475b5c35eb38a88ad7e7b9908eef54735f"),
+        # ("03a42d6da845fa550db7f79cb8f3cc6ad6f776e7d75111edeef96f3c1e0c152294", "02b9cc0ff32d93fd2f235ab38e4bad0ea393c90aa63fd757f2f0df09110389038f"),
+        # ("02e63191b7e52c74cd8cfc666eea44cc6401e6912e2db7ba030a931beb90f17240", "03eab3f5b1955fbebd3019b0e9ce41412884afc2b22ef05017f8e957b93170e41c"),
+        ("02dd04e277bf2ee7e8cd8e9766d5615005ac19fa872be8cdfe612a9950ada27b70", "0221ac650cdfd2a7a45102536fa95c3fd9f203de5ff5648f527181082ddd33097a"),
+        # ("0354309594599317ac9bea94c845f2212579afbdd6ed7f2bd972f4c9182f00899a", "0261867ef8d1297270157ab3d01fffa4c51ef2435a98186e41e705b0918ed695a2"),
+        # ("0362503d3d158444d9ded9a88a6e4308f75d17d96e453c911296cd514a5551f10c", "03e07c085c07e494fd4680b58e7bb51aec5375d935ab0c571562668a33379504d7"),
+        # ("03f3524a54dd984f9586df24cc3adb20dce0932e2d7e5eaeb4388b3440319ffff5", "03b3343114f4331076b045d2ffd7e6fea10ef6ec5183a25939833e00131c2f3dfd"),
+        # ("02f93201a24036d1c91ec08f656b1d565cdbd0dc1e1f35f44911662a9e03f13cf9", "03facb07b0923165778ea4cd8a59f07dce1000fc5810f5beb82a4a7f852a4b453f"),
+        # ("03f3524a54dd984f9586df24cc3adb20dce0932e2d7e5eaeb4388b3440319ffff5", "03b3343114f4331076b045d2ffd7e6fea10ef6ec5183a25939833e00131c2f3dfd"),
     ]
     
     # If no specific pairs provided, generate random ones
@@ -805,7 +854,7 @@ def main():
         print("No specific pairs provided, generating random pairs...")
         sender_receiver_pairs = get_random_sender_receiver_pairs(
             json_file="LNdata.json", 
-            num_pairs=10, 
+            num_pairs=20, 
             seed=seed
         )
     
@@ -824,9 +873,9 @@ def main():
         result = comparison.run_comparison(
             sender=sender,
             receiver=receiver,
-            amount=25000.0,               # payment amount
+            amount=5000.0,               # payment amount
             p_willing=0.6,                # willingness to share info
-            min_path_nodes=5,             # minimum path length
+            min_path_nodes=2,             # minimum path length
             max_paths_checked=1000,       # maximum paths to check
             include_endpoints_in_share=False,  # endpoints already known
             verbose=True                 # set to True for detailed output
