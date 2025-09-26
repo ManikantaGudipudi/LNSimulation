@@ -294,20 +294,10 @@ This project is designed for research and educational purposes. Contributions ar
 - **Documentation**: Improve guides and examples
 - **Bug Fixes**: Report and fix issues
 
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
 ## 🙏 Acknowledgments
 
 - **Lightning Network Community**: For the open-source protocol and data
 - **NetworkX**: For the excellent graph analysis library
 - **Research Community**: For insights into Lightning Network routing challenges
-
-## 📞 Contact
-
-For questions, suggestions, or collaboration opportunities, please open an issue or contact the maintainers.
-
----
 
 **Note**: This simulation is for research and educational purposes. Real Lightning Network behavior may differ due to additional factors not modeled here, such as network congestion, node availability, and real-time channel state changes.
